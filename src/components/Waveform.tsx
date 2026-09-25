@@ -57,11 +57,29 @@ interface WaveformProps {
   onEditFeedback: (r: ChainEditResult | 'locked' | null) => void;
 }
 
-type DragState =
-  | { mode: 'maybe-create'; startT: number }
-  | { mode: 'create'; startT: number; curT: number }
-  | { mode: 'move'; id: string; grabOffset: number }
-  | { mode: 'resize'; id: string; edge: 'start' | 'end' };
+type PendingGesture =
+  | { kind: 'create'; startT: number }
+  | { kind: 'move'; id: string; grabOffset: number }
+  | { kind: 'resize'; id: string; edge: 'start' | 'end' }
+  | { kind: 'locked'; id: string };
+
+/**
+ * 一次鼠标手势的完整状态：
+ * - committed=false：按下后位移仍 ≤ CLICK_PX，按“单击”处理（定位 / 异常带试听）；
+ *   超过阈值才提交为真正的编辑手势（拖建 / 移动 / 缩放 / 锁定尝试），
+ *   轻微抖动不会产生任何章节编辑或定位。
+ * - 单击普通或锁定章节（含边界）：选中章节并把播放头移到点击时间，
+ *   播放原声时从该处继续播放，暂停时只定位；点中音量异常带则仍按
+ *   现有规则试听（band 为按下瞬间命中的异常带）。
+ */
+interface Gesture {
+  /** 按下点相对画布的 x（用于位移阈值判定）与对应时间（单击定位落点） */
+  downX: number;
+  downT: number;
+  committed: boolean;
+  band: LoudnessSegment | null;
+  pending: PendingGesture;
+}
 
 /** 拖拽中的连锁预览：被带动章节 + 止点。 */
 interface ChainPreview {
@@ -96,8 +114,9 @@ export function Waveform(props: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [viewportW, setViewportW] = useState(800);
   const [scrollLeft, setScrollLeft] = useState(0);
-  const [drag, setDrag] = useState<DragState | null>(null);
-  const dragRef = useRef<DragState | null>(null);
+  // 拖建区间的实时预览（仅此一种手势需要重绘画布）；其它手势状态放在 ref
+  const [createDrag, setCreateDrag] = useState<{ startT: number; curT: number } | null>(null);
+  const gestureRef = useRef<Gesture | null>(null);
   const [chainPreview, setChainPreview] = useState<ChainPreview | null>(null);
   const chainPreviewRef = useRef<ChainPreview | null>(null);
   const pendingAnchor = useRef<{ t: number; x: number } | null>(null);
@@ -176,98 +195,105 @@ export function Waveform(props: WaveformProps) {
   );
 
   // ---- mouse interactions ----
+  // 统一点击 / 拖拽判定：按下后只有水平位移超过 CLICK_PX 才提交为编辑手势
+  //（拖建 / 移动 / 缩放 / 锁定拖动提示）；否则按单击处理。window 上的
+  // mousemove / mouseup 保证鼠标移出画布、在画布外松开时仍按实际手势收尾。
   const onMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
     const { t, x } = timeAtClientX(e.clientX);
     const hit = hitTest(t, x);
     const band = hitBand(t);
 
-    // 锁定章节：允许选中、允许点击异常带预览，但不启动移动/缩放；
-    // 只有真的“按住拖了一下”才提示锁定原因，避免普通点选也弹提示。
-    if (hit && props.lockedIds.has(hit.chapter.id)) {
-      props.onSelect(hit.chapter.id);
-      const startX = e.clientX;
-      let hinted = false;
-      const onWinMoveLock = (ev2: MouseEvent) => {
-        if (!hinted && Math.abs(ev2.clientX - startX) > CLICK_PX) {
-          hinted = true;
-          propsRef.current.onLockedAttempt(hit.chapter.id);
-        }
-      };
-      const onWinUpLock = (ev: MouseEvent) => {
-        window.removeEventListener('mousemove', onWinMoveLock);
-        window.removeEventListener('mouseup', onWinUpLock);
-        if (!hinted) {
-          const { t: ct2 } = timeAtClientX(ev.clientX);
-          if (hitBand(ct2)) propsRef.current.onPreviewSegment(ct2);
-        }
-      };
-      window.addEventListener('mousemove', onWinMoveLock);
-      window.addEventListener('mouseup', onWinUpLock);
-      return;
-    }
+    // 按下即选中命中的章节（普通 / 锁定一致），单击定位与后续拖拽都不改变它
+    if (hit) props.onSelect(hit.chapter.id);
 
-    let next: DragState;
-    if (hit) {
-      props.onSelect(hit.chapter.id);
-      if (hit.edge === 'body') {
-        next = { mode: 'move', id: hit.chapter.id, grabOffset: t - hit.chapter.start };
-      } else {
-        next = { mode: 'resize', id: hit.chapter.id, edge: hit.edge };
-      }
-    } else {
-      next = { mode: 'maybe-create', startT: t };
-    }
-    dragRef.current = next;
-    setDrag(next);
+    const pending: PendingGesture = hit
+      ? props.lockedIds.has(hit.chapter.id)
+        ? { kind: 'locked', id: hit.chapter.id }
+        : hit.edge === 'body'
+          ? { kind: 'move', id: hit.chapter.id, grabOffset: t - hit.chapter.start }
+          : { kind: 'resize', id: hit.chapter.id, edge: hit.edge }
+      : { kind: 'create', startT: t };
+    gestureRef.current = { downX: x, downT: t, committed: false, band, pending };
 
     const onWinMove = (ev: MouseEvent) => {
-      const cur = dragRef.current;
-      if (!cur) return;
-      const { t: ct } = timeAtClientX(ev.clientX);
-      if (cur.mode === 'maybe-create') {
-        if (Math.abs(ct - cur.startT) * pxPerSec > 4) {
-          const next2: DragState = { mode: 'create', startT: cur.startT, curT: ct };
-          dragRef.current = next2;
-          setDrag(next2);
+      const g = gestureRef.current;
+      if (!g) return;
+      const { t: ct, x: cx } = timeAtClientX(ev.clientX);
+
+      // 未提交：轻微抖动（≤ CLICK_PX）不提交任何手势，也不产生章节编辑
+      if (!g.committed) {
+        if (Math.abs(cx - g.downX) <= CLICK_PX) return;
+        g.committed = true;
+        if (g.pending.kind === 'locked') {
+          // 锁定章节：真正“按住拖了一下”才提示锁定原因，普通点选不弹提示
+          propsRef.current.onLockedAttempt(g.pending.id);
+          return;
         }
-      } else if (cur.mode === 'create') {
-        const next2 = { ...cur, curT: ct };
-        dragRef.current = next2;
-        setDrag(next2);
-      } else if (cur.mode === 'move') {
-        const r = propsRef.current.onMove(cur.id, ct - cur.grabOffset, SNAP_PX / pxPerSec);
+        if (g.pending.kind === 'create') {
+          setCreateDrag({ startT: g.pending.startT, curT: ct });
+          return;
+        }
+      }
+
+      if (g.pending.kind === 'create') {
+        setCreateDrag({ startT: g.pending.startT, curT: ct });
+      } else if (g.pending.kind === 'move') {
+        const r = propsRef.current.onMove(
+          g.pending.id,
+          ct - g.pending.grabOffset,
+          SNAP_PX / pxPerSec,
+        );
         handleEditResult(r);
-      } else if (cur.mode === 'resize') {
-        const r = propsRef.current.onResize(cur.id, cur.edge, ct, SNAP_PX / pxPerSec);
+      } else if (g.pending.kind === 'resize') {
+        const r = propsRef.current.onResize(
+          g.pending.id,
+          g.pending.edge,
+          ct,
+          SNAP_PX / pxPerSec,
+        );
         handleEditResult(r);
       }
+      // locked：提交后后续移动不再重复提示
     };
+
     const onWinUp = (ev: MouseEvent) => {
       window.removeEventListener('mousemove', onWinMove);
       window.removeEventListener('mouseup', onWinUp);
-      const cur = dragRef.current;
-      dragRef.current = null;
-      setDrag(null);
+      const g = gestureRef.current;
+      gestureRef.current = null;
       chainPreviewRef.current = null;
       setChainPreview(null);
+      setCreateDrag(null);
       propsRef.current.onEditFeedback(null);
-      if (!cur) return;
-      const { t: ct, x: cx } = timeAtClientX(ev.clientX);
-      const isClick = Math.abs(cx - x) <= CLICK_PX;
-      if (cur.mode === 'maybe-create') {
-        // click on an abnormal band -> preview from there; otherwise seek
-        if (isClick && (band || hitBand(ct))) {
-          propsRef.current.onPreviewSegment(ct);
-        } else {
-          propsRef.current.onSeek(ct);
-          propsRef.current.onSelect(null);
+      if (!g) return;
+
+      const { t: ct } = timeAtClientX(ev.clientX);
+      if (g.committed) {
+        // 真正的编辑手势：保持原有编辑行为，不触发定位 / 试听
+        if (g.pending.kind === 'create') {
+          propsRef.current.onCreateFromDrag(g.pending.startT, ct, SNAP_PX / pxPerSec);
         }
-      } else if (cur.mode === 'move' && isClick && (band || hitBand(ct))) {
-        // stationary click on a band inside a chapter -> preview from there
-        propsRef.current.onPreviewSegment(ct);
-      } else if (cur.mode === 'create') {
-        propsRef.current.onCreateFromDrag(cur.startT, ct, SNAP_PX / pxPerSec);
+        return;
+      }
+
+      // —— 单击（位移未超过阈值；即便在画布外松开，定位也以按下点为准）——
+      const onChapter =
+        g.pending.kind === 'move' || g.pending.kind === 'resize' || g.pending.kind === 'locked';
+
+      // 点中音量异常带（章节内外一致）：按现有规则从该处试听
+      if (g.band) {
+        propsRef.current.onPreviewSegment(g.downT);
+        return;
+      }
+      if (g.pending.kind === 'create') {
+        // 空白处单击：定位到按下点并清除选中
+        propsRef.current.onSeek(g.downT);
+        propsRef.current.onSelect(null);
+      } else if (onChapter) {
+        // 普通或锁定章节内部 / 边界单击：选中（按下时已选）并定位；
+        // 播放中原声从该处继续，暂停时只定位——统一走 App 的 seek 通路
+        propsRef.current.onSeek(g.downT);
       }
     };
     window.addEventListener('mousemove', onWinMove);
@@ -292,7 +318,7 @@ export function Waveform(props: WaveformProps) {
   };
 
   const onHover = (e: React.MouseEvent) => {
-    if (dragRef.current) return;
+    if (gestureRef.current) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const { t, x } = timeAtClientX(e.clientX);
@@ -387,9 +413,9 @@ export function Waveform(props: WaveformProps) {
     }
 
     // drag-create preview
-    if (drag && drag.mode === 'create') {
-      const a = Math.min(drag.startT, drag.curT) * pxPerSec - scrollLeft;
-      const b = Math.max(drag.startT, drag.curT) * pxPerSec - scrollLeft;
+    if (createDrag) {
+      const a = Math.min(createDrag.startT, createDrag.curT) * pxPerSec - scrollLeft;
+      const b = Math.max(createDrag.startT, createDrag.curT) * pxPerSec - scrollLeft;
       ctx.fillStyle = 'rgba(255, 255, 255, 0.18)';
       ctx.fillRect(a, waveTop, b - a, waveH);
     }
@@ -585,7 +611,7 @@ export function Waveform(props: WaveformProps) {
     pxPerSec,
     scrollLeft,
     viewportW,
-    drag,
+    createDrag,
     duration,
     suggestions,
     loudnessSegments,

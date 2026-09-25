@@ -1443,7 +1443,8 @@ export default function App() {
                   <li><kbd>Ctrl</kbd>+<kbd>←</kbd><kbd>→</kbd> 调整终点</li>
                   <li><kbd>L</kbd> 锁定 / 解锁选中章节（连锁移动的固定止点，仅当前会话）</li>
                   <li><kbd>Delete</kbd> 删除选中章节</li>
-                  <li>滚轮：缩放波形；拖拽空白：创建章节</li>
+                  <li>单击波形（含章节内部 / 边界）：定位播放头，播放中从该处继续；点异常色块则试听</li>
+                  <li>滚轮：缩放波形；拖拽空白：创建章节；拖章节 / 边界：移动 / 调整（锁定章节不可拖）</li>
                 </ul>
               </div>
             </aside>
